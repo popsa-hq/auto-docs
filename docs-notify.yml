@@ -1,0 +1,81 @@
+# Sender workflow — copy this into each source repository.
+#
+# Fires on push to the main branch and dispatches a docs-update event
+# to your central documentation repository with metadata about the change.
+#
+# Prerequisites:
+#   1. Create a GitHub PAT with `repo` scope
+#   2. Add it as a secret named DOCS_DISPATCH_TOKEN in this repository
+#   3. Update the `repository` field below to point at your docs repo
+
+name: Notify Docs
+
+on:
+  push:
+    branches: [main] # Change to match your default branch
+
+jobs:
+  notify:
+    name: Dispatch docs update
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # Need HEAD~1 for diff
+
+      - name: Collect metadata
+        id: meta
+        run: |
+          # Changed paths (comma-separated)
+          CHANGED=$(git diff --name-only HEAD~1 HEAD | tr '\n' ',' | sed 's/,$//')
+          echo "changed_paths=$CHANGED" >> "$GITHUB_OUTPUT"
+
+          # Version from latest tag (if semver tags exist)
+          VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # Detect major version bump by comparing with previous tag
+          if [ -n "$VERSION" ]; then
+            CURRENT_MAJOR=$(echo "$VERSION" | sed 's/^v//' | cut -d'.' -f1)
+            PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+            if [ -n "$PREV_TAG" ]; then
+              PREV_MAJOR=$(echo "$PREV_TAG" | sed 's/^v//' | cut -d'.' -f1)
+              if [ "$CURRENT_MAJOR" != "$PREV_MAJOR" ]; then
+                echo "is_major_version=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "is_major_version=false" >> "$GITHUB_OUTPUT"
+              fi
+            else
+              echo "is_major_version=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "is_major_version=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # PR title from merge commit (if squash-merged)
+          PR_TITLE=$(git log -1 --pretty=%s)
+          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
+
+          # PR number (extract from merge commit if present)
+          PR_NUMBER=$(echo "$PR_TITLE" | grep -oP '#\K[0-9]+' | head -1 || echo "")
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch to docs repo
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+          repository: your-org/your-docs-repo # <-- Replace with your docs repo
+          event-type: docs-update
+          client-payload: |
+            {
+              "repository": "${{ github.repository }}",
+              "branch": "${{ github.ref_name }}",
+              "sha": "${{ github.sha }}",
+              "changed_paths": ${{ toJSON(steps.meta.outputs.changed_paths) }},
+              "version": "${{ steps.meta.outputs.version }}",
+              "is_major_version": ${{ steps.meta.outputs.is_major_version }},
+              "pr_title": ${{ toJSON(steps.meta.outputs.pr_title) }},
+              "pr_number": "${{ steps.meta.outputs.pr_number }}"
+            }

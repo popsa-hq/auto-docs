@@ -1,0 +1,94 @@
+# Auto-Docs Configuration
+#
+# Maps source repositories to the documentation files they affect.
+# Used by auto-docs-update.yml to determine which docs to regenerate
+# when a source repo dispatches a docs-update event.
+#
+# Copy this file to .github/docs-config.yml in your docs repo and
+# customise it for your organisation.
+#
+# watch_paths: glob patterns matched against the changed file paths from
+# the source repo. Only doc files whose watch_paths intersect with the
+# actual changes are regenerated. If nothing matches, no PR is created.
+
+repositories:
+  # Backend monorepo
+  org/backend:
+    branch: main
+    checkout_path: source/backend
+    docs:
+      - file: standards/go.md
+        scope: "Go coding standards, conventions, package structure, error handling, and tooling"
+        watch_paths:
+          - "**/*.go"
+          - "go.mod"
+          - "go.sum"
+          - ".golangci.yml"
+          - "Makefile"
+      - file: architecture/services.md
+        scope: "Service boundaries, API contracts, inter-service communication, and ownership"
+        watch_paths:
+          - "**/cmd/"
+          - "**/internal/"
+          - "docker-compose*"
+          - "**/proto/**"
+          - "**/api/**"
+
+  # Web application
+  org/web-app:
+    branch: main
+    checkout_path: source/web-app
+    docs:
+      - file: standards/typescript.md
+        scope: "TypeScript/React coding standards, project structure, state management, and testing"
+        watch_paths:
+          - "**/*.ts"
+          - "**/*.tsx"
+          - "package.json"
+          - ".eslintrc*"
+          - "tsconfig*"
+          - "jest.config*"
+
+  # iOS application
+  org/ios-app:
+    branch: main
+    checkout_path: source/ios-app
+    docs:
+      - file: standards/swift.md
+        scope: "Swift/iOS coding standards, architecture patterns, UIKit/SwiftUI conventions, and dependencies"
+        watch_paths:
+          - "**/*.swift"
+          - "*.xcodeproj/**"
+          - "*.xcworkspace/**"
+          - "Package.swift"
+          - "Package.resolved"
+          - ".swiftlint.yml"
+
+  # Android application
+  org/android-app:
+    branch: main
+    checkout_path: source/android-app
+    docs:
+      - file: standards/kotlin.md
+        scope: "Kotlin/Android coding standards, architecture, Jetpack components, and dependencies"
+        watch_paths:
+          - "**/*.kt"
+          - "**/*.kts"
+          - "build.gradle*"
+          - "settings.gradle*"
+          - "gradle/**"
+          - ".editorconfig"
+
+  # Wildcard — matches any repo in the org not listed above.
+  # The receiver workflow falls back to this entry when no exact match
+  # is found for the dispatching repository.
+  #
+  # org/*:
+  #   branch: main
+  #   checkout_path: source/other-repo
+  #   docs:
+  #     - file: standards/go.md
+  #       scope: "Go conventions observed in this service"
+  #       watch_paths:
+  #         - "**/*.go"
+  #         - "go.mod"

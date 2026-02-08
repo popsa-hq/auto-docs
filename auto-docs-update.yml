@@ -1,0 +1,299 @@
+# Receiver workflow — copy this into your central documentation repository.
+#
+# Triggered by repository_dispatch events from source repos when code merges
+# to their main branch. Resolves which documentation files are affected,
+# runs Claude Code to regenerate them, and opens a PR for review.
+#
+# Prerequisites:
+#   1. An Anthropic API key stored as CLAUDE_API_KEY secret
+#   2. A GitHub PAT with `repo` scope stored as DOCS_DISPATCH_TOKEN secret
+#      (used to check out private source repos)
+#   3. A docs-config.yml file at .github/docs-config.yml
+#   4. A prompt template at .github/auto-docs-prompt.md
+
+name: Auto-Docs Update
+
+on:
+  repository_dispatch:
+    types: [docs-update]
+
+# Only one docs update per source repo at a time. New dispatches queue
+# rather than cancel — we don't want to lose changes.
+concurrency:
+  group: auto-docs-${{ github.event.client_payload.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-docs:
+    name: Update Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Parse dispatch payload
+        id: payload
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_BRANCH: ${{ github.event.client_payload.branch }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+          PAYLOAD_CHANGED_PATHS: ${{ github.event.client_payload.changed_paths }}
+          PAYLOAD_VERSION: ${{ github.event.client_payload.version }}
+          PAYLOAD_IS_MAJOR_VERSION: ${{ github.event.client_payload.is_major_version }}
+          PAYLOAD_PR_TITLE: ${{ github.event.client_payload.pr_title }}
+        run: |
+          echo "repository=$PAYLOAD_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "branch=$PAYLOAD_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "sha=$PAYLOAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$(echo "$PAYLOAD_SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          echo "changed_paths=$PAYLOAD_CHANGED_PATHS" >> "$GITHUB_OUTPUT"
+          echo "version=$PAYLOAD_VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_major_version=$PAYLOAD_IS_MAJOR_VERSION" >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PAYLOAD_PR_TITLE" >> "$GITHUB_OUTPUT"
+
+          # Derive repo short name for branch naming (e.g., "backend", "ios-app")
+          REPO_SHORT=$(echo "$PAYLOAD_REPOSITORY" | sed 's|.*/||')
+          echo "repo_short=$REPO_SHORT" >> "$GITHUB_OUTPUT"
+
+          echo "title_prefix=auto-update from ${REPO_SHORT}@" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout docs repo
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Resolve config for source repo
+        id: config
+        env:
+          REPO: ${{ steps.payload.outputs.repository }}
+          CHANGED: ${{ steps.payload.outputs.changed_paths }}
+        run: |
+          # Install yq for YAML parsing
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+          CONFIG_FILE=".github/docs-config.yml"
+
+          # Try exact match first, then wildcard (org/*)
+          ORG=$(echo "$REPO" | cut -d'/' -f1)
+          REPO_KEY="$REPO"
+          if ! yq e ".repositories[\"$REPO_KEY\"]" "$CONFIG_FILE" | grep -q "branch"; then
+            REPO_KEY="$ORG/*"
+          fi
+
+          # Extract checkout path and branch
+          CHECKOUT_PATH=$(yq e ".repositories[\"$REPO_KEY\"].checkout_path" "$CONFIG_FILE")
+          SOURCE_BRANCH=$(yq e ".repositories[\"$REPO_KEY\"].branch" "$CONFIG_FILE")
+          echo "checkout_path=$CHECKOUT_PATH" >> "$GITHUB_OUTPUT"
+          echo "source_branch=$SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
+
+          # Determine which doc files need updating based on watch_paths
+          DOCS_COUNT=$(yq e ".repositories[\"$REPO_KEY\"].docs | length" "$CONFIG_FILE")
+          AFFECTED_DOCS=""
+          AFFECTED_SCOPES=""
+
+          for i in $(seq 0 $((DOCS_COUNT - 1))); do
+            DOC_FILE=$(yq e ".repositories[\"$REPO_KEY\"].docs[$i].file" "$CONFIG_FILE")
+            SCOPE=$(yq e ".repositories[\"$REPO_KEY\"].docs[$i].scope" "$CONFIG_FILE")
+            WATCH_COUNT=$(yq e ".repositories[\"$REPO_KEY\"].docs[$i].watch_paths | length" "$CONFIG_FILE")
+
+            MATCHED=false
+            for j in $(seq 0 $((WATCH_COUNT - 1))); do
+              PATTERN=$(yq e ".repositories[\"$REPO_KEY\"].docs[$i].watch_paths[$j]" "$CONFIG_FILE")
+              # Simple glob matching: convert glob to grep-compatible regex
+              REGEX=$(echo "$PATTERN" | sed 's/\*\*/__GLOBSTAR__/g' | sed 's/\./\\./g' | sed 's/\*/[^\/]*/g' | sed 's/__GLOBSTAR__/.*/g' | sed 's|^\.\*\/|^(.*\/)?|')
+              if echo "$CHANGED" | tr ',' '\n' | grep -qE "$REGEX"; then
+                MATCHED=true
+                break
+              fi
+            done
+
+            if [ "$MATCHED" = true ]; then
+              AFFECTED_DOCS="${AFFECTED_DOCS}${DOC_FILE},"
+              AFFECTED_SCOPES="${AFFECTED_SCOPES}${DOC_FILE}:${SCOPE}|"
+            fi
+          done
+
+          # Trim trailing delimiters
+          AFFECTED_DOCS="${AFFECTED_DOCS%,}"
+          AFFECTED_SCOPES="${AFFECTED_SCOPES%|}"
+
+          echo "affected_docs=$AFFECTED_DOCS" >> "$GITHUB_OUTPUT"
+          echo "affected_scopes=$AFFECTED_SCOPES" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$AFFECTED_DOCS" ]; then
+            echo "No documentation files affected by these changes."
+            echo "has_affected_docs=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Affected docs: $AFFECTED_DOCS"
+            echo "has_affected_docs=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout source repo
+        if: steps.config.outputs.has_affected_docs == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.payload.outputs.repository }}
+          ref: ${{ steps.payload.outputs.sha }}
+          path: ${{ steps.config.outputs.checkout_path }}
+          token: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+
+      - name: Create working branch
+        if: steps.config.outputs.has_affected_docs == 'true'
+        env:
+          REPO_SHORT: ${{ steps.payload.outputs.repo_short }}
+          SHA_SHORT: ${{ steps.payload.outputs.sha_short }}
+        run: |
+          BRANCH_NAME="auto-docs/${REPO_SHORT}-${SHA_SHORT}"
+          git checkout -b "$BRANCH_NAME"
+          echo "WORKING_BRANCH=$BRANCH_NAME" >> "$GITHUB_ENV"
+
+      - name: Install Claude Code
+        if: steps.config.outputs.has_affected_docs == 'true'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run Claude Code for each affected doc
+        if: steps.config.outputs.has_affected_docs == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          AFFECTED_SCOPES: ${{ steps.config.outputs.affected_scopes }}
+          SOURCE_PATH: ${{ steps.config.outputs.checkout_path }}
+          REPOSITORY: ${{ steps.payload.outputs.repository }}
+          CHANGED_PATHS: ${{ steps.payload.outputs.changed_paths }}
+          SHA: ${{ steps.payload.outputs.sha }}
+          SHA_SHORT: ${{ steps.payload.outputs.sha_short }}
+          BRANCH: ${{ steps.payload.outputs.branch }}
+        run: |
+          IFS='|' read -ra DOC_ENTRIES <<< "$AFFECTED_SCOPES"
+
+          for entry in "${DOC_ENTRIES[@]}"; do
+            DOC_FILE=$(echo "$entry" | cut -d':' -f1)
+            SCOPE=$(echo "$entry" | cut -d':' -f2-)
+
+            echo "=== Updating $DOC_FILE ==="
+
+            # Read the prompt template and substitute variables
+            PROMPT=$(cat .github/auto-docs-prompt.md)
+            PROMPT="${PROMPT//\$DOC_FILE/$DOC_FILE}"
+            PROMPT="${PROMPT//\$SOURCE_PATH/$SOURCE_PATH}"
+            PROMPT="${PROMPT//\$REPOSITORY/$REPOSITORY}"
+            PROMPT="${PROMPT//\$SCOPE/$SCOPE}"
+            PROMPT="${PROMPT//\$CHANGED_PATHS/$CHANGED_PATHS}"
+            PROMPT="${PROMPT//\$SHA_SHORT/$SHA_SHORT}"
+            PROMPT="${PROMPT//\$SHA/$SHA}"
+            PROMPT="${PROMPT//\$BRANCH/$BRANCH}"
+
+            # Derive component name from doc file path (e.g., "standards/go.md" -> "go")
+            COMPONENT=$(basename "$DOC_FILE" .md)
+            PROMPT="${PROMPT//\$COMPONENT/$COMPONENT}"
+
+            claude -p "$PROMPT" --allowedTools "Read,Glob,Grep,Edit,Write,Bash" || true
+          done
+
+      # Optional: handle major version bumps by updating architecture history.
+      # Remove this step if you don't maintain a version history document.
+      - name: Handle major version — update architecture history
+        if: >-
+          steps.config.outputs.has_affected_docs == 'true' &&
+          steps.payload.outputs.is_major_version == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          REPOSITORY: ${{ steps.payload.outputs.repository }}
+          VERSION: ${{ steps.payload.outputs.version }}
+          SOURCE_PATH: ${{ steps.config.outputs.checkout_path }}
+        run: |
+          HISTORY_PROMPT="You are updating the architecture history log.
+
+          A major version has been released:
+          - Repository: ${REPOSITORY}
+          - Version: ${VERSION}
+          - Source code: ${SOURCE_PATH}
+
+          Read architecture/history.md and the source repository.
+          Compare the new code structure against the current documentation.
+          If there are significant architectural changes (new navigation patterns,
+          new module boundaries, new frameworks adopted, major refactors), append
+          a dated entry to architecture/history.md following the existing format.
+
+          If there are no architectural changes despite the major version bump,
+          do not modify the file.
+
+          Do not commit — leave changes uncommitted."
+
+          claude -p "$HISTORY_PROMPT" --allowedTools "Read,Glob,Grep,Edit,Write,Bash" || true
+
+      - name: Check for changes
+        if: steps.config.outputs.has_affected_docs == 'true'
+        id: changes
+        env:
+          CHECKOUT_PATH: ${{ steps.config.outputs.checkout_path }}
+        run: |
+          # Remove source checkout before committing (not part of docs repo)
+          rm -rf "$CHECKOUT_PATH"
+
+          # Check for uncommitted changes, new commits, or new untracked files from Claude
+          if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ] && [ "$(git rev-list main..HEAD --count)" -eq 0 ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            # Reset any commits Claude may have made, keeping changes staged
+            git reset main --soft
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push
+        if: >-
+          steps.config.outputs.has_affected_docs == 'true' &&
+          steps.changes.outputs.has_changes == 'true'
+        env:
+          REPOSITORY: ${{ steps.payload.outputs.repository }}
+          SHA_SHORT: ${{ steps.payload.outputs.sha_short }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "docs: auto-update from ${REPOSITORY}@${SHA_SHORT}"
+          git fetch origin "$WORKING_BRANCH" || true
+          git push --force-with-lease -u origin "$WORKING_BRANCH"
+
+      - name: Create pull request
+        id: pr
+        if: >-
+          steps.config.outputs.has_affected_docs == 'true' &&
+          steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ steps.payload.outputs.repository }}
+          SHA: ${{ steps.payload.outputs.sha }}
+          SHA_SHORT: ${{ steps.payload.outputs.sha_short }}
+          BRANCH: ${{ steps.payload.outputs.branch }}
+          PR_TITLE: ${{ steps.payload.outputs.pr_title }}
+          REPO_SHORT: ${{ steps.payload.outputs.repo_short }}
+          AFFECTED_DOCS: ${{ steps.config.outputs.affected_docs }}
+        run: |
+          BODY="## Auto-generated documentation update
+
+          **Source:** \`${REPOSITORY}\` @ [\`${SHA_SHORT}\`](https://github.com/${REPOSITORY}/commit/${SHA})
+          **Branch:** \`${BRANCH}\`
+          **Trigger:** ${PR_TITLE}
+
+          ### Files updated
+
+          $(echo "$AFFECTED_DOCS" | tr ',' '\n' | sed 's/^/- `/' | sed 's/$/`/')
+
+          ### Review checklist
+
+          - [ ] Changes accurately reflect the current state of the source repo
+          - [ ] No sensitive information included
+          - [ ] Markdown linting passes"
+
+          PR_URL=$(gh pr create \
+            --title "docs: ${{ steps.payload.outputs.title_prefix }}${SHA_SHORT}" \
+            --body "$BODY" \
+            --base main \
+            --label "auto-docs")
+
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
